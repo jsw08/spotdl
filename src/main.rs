@@ -7,15 +7,12 @@ use authentication::authorize;
 use clap::Parser;
 use cli::Args;
 use directories::ProjectDirs;
-use downloader::{DlErrors, DownloadTrack};
+use downloader::{DlErrors, DownloadTrack, DownloadTrackStatus, FetchTrackStatus, SpotifyIDs};
 use errors::Errors;
-use indicatif::{ProgressBar, ProgressState, ProgressStyle};
-use librespot_core::{
-    cache::Cache,
-    spotify_id::{SpotifyId, SpotifyItemType},
-};
-use librespot_metadata::{Metadata, Playlist, Track};
-use std::{env, fmt::Write, fs, time};
+use indicatif::{ProgressBar, ProgressStyle};
+use librespot_core::cache::Cache;
+use librespot_metadata::Track;
+use std::{env, fs, time};
 
 const LIGHT_GRAY_BOLD: &str = "\x1b[37m";
 const RESET: &str = "\x1b[0m";
@@ -43,10 +40,11 @@ async fn main() -> Result<(), Errors> {
         None => env::current_dir().expect("Unable to get current directory"),
     };
 
-    let tracks_ids = args
+    let track_ids = args
         .parse_source(&session)
         .await
         .ok_or(Errors::InvalidPlaylist)?;
+    let tracks_len = track_ids.len();
 
     let sty = ProgressStyle::with_template(
         "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
@@ -54,51 +52,92 @@ async fn main() -> Result<(), Errors> {
     .unwrap()
     .progress_chars("##-");
 
-    let pb = ProgressBar::new(tracks_ids.len() as u64);
+    let pb = ProgressBar::new(tracks_len as u64);
     pb.set_style(sty.clone());
     println!("{LIGHT_GRAY_BOLD}[1/2]{RESET} 🔍 Fetching song metadata...");
 
-    let mut tracks: Vec<Track> = Vec::new();
-    for id in &tracks_ids {
-        pb.inc(1);
-        match Track::get(&session, &id).await {
-            Ok(v) => {
-                pb.set_message(format!("{}", v.name));
-                tracks.push(v);
-            }
-            Err(e) => {
-                pb.set_message(format!("ERROR: {}", id.id));
-                continue;
-            }
-        };
-    }
+    let tracks = track_ids
+        .get_tracks(
+            &session,
+            Some(|status| {
+                pb.inc(1);
+                match status {
+                    FetchTrackStatus::Error(err, id) => {
+                        eprintln!("Failed to fetch metadata about id: {}", id);
+                        pb.set_message(format!("ERROR ({id}): {err}"));
+                    }
+                    FetchTrackStatus::Update(name) => {
+                        pb.set_message(name);
+                    }
+                }
+            }),
+        )
+        .await
+        .ok_or(Errors::InvalidPlaylist)?;
+
     pb.finish_and_clear();
     println!("{LIGHT_GRAY_BOLD}[2/2]{RESET} 🔐 Downloading and decrypting songs...");
-    let pb = ProgressBar::new(tracks_ids.len() as u64);
+    let pb = ProgressBar::new(tracks_len as u64);
     pb.set_style(sty.clone());
 
     let mut missing_tracks: Vec<Track> = Vec::new();
     let mut last_track = time::Instant::now();
     let delay = time::Duration::from_millis(args.timeout);
 
-    for track in tracks {
+    for (index, track) in tracks.iter().enumerate() {
         pb.set_message(format!("{}", track.name));
 
-        if let Err(e) = track.download(&session, &path).await {
+        if let Err(e) = track
+            .download(
+                &session,
+                &path,
+                Some(|cback| match cback {
+                    DownloadTrackStatus::Searching => {
+                        pb.set_message(format!("🔎 Searching for files '{}'...", track.name))
+                    }
+                    DownloadTrackStatus::Downloading => {
+                        pb.set_message(format!("🔐 Downloading and decrypting '{}'...", track.name))
+                    }
+                }),
+            )
+            .await
+        {
             if matches!(e, DlErrors::TrackExists) {
+                pb.inc(1);
                 continue;
             };
 
             pb.set_message(format!("ERROR: {:?} - {}", e, track.name));
-            missing_tracks.push(track);
+            missing_tracks.push(track.clone());
         };
 
         pb.inc(1);
-        pb.set_message("sleeping 💤");
-        tokio::time::sleep(delay - last_track.elapsed()).await;
-        last_track = time::Instant::now();
+        if index + 1 != tracks_len {
+            pb.set_message("💤 Sleeping...");
+            tokio::time::sleep(delay - last_track.elapsed()).await;
+            last_track = time::Instant::now();
+        }
     }
 
-    println!("{:?}", missing_tracks);
+    pb.finish_and_clear();
+    println!("Finished!");
+
+    if !missing_tracks.is_empty() {
+        println!("Failed to download a few songs:");
+        for track in missing_tracks {
+            println!(
+                "{} by {} ({}).",
+                track.name,
+                track
+                    .artists
+                    .iter()
+                    .map(|artist| artist.name.clone())
+                    .collect::<Vec<String>>()
+                    .join(", "),
+                track.id.to_uri().unwrap_or("no id".to_string())
+            );
+        }
+    }
+
     Ok(())
 }

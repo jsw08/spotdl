@@ -1,6 +1,6 @@
 [package]
 name = "spotdl"
-version = "0.1.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
@@ -11,4 +11,5 @@ librespot-audio = "0.6.0"
 librespot-core = "0.6.0"
 librespot-metadata = "0.6.0"
 librespot-oauth = "0.6.0"
+regex = "1.11.1"
 tokio = {version = "1.45.0", features = ["full"]}

@@ -4,5 +4,4 @@ pub enum Errors {
     InvalidArguments,
     Login,
     InvalidPlaylist,
-    SongNotFound,
 }
