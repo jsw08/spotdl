@@ -43,29 +43,10 @@ async fn main() -> Result<(), Errors> {
         None => env::current_dir().expect("Unable to get current directory"),
     };
 
-    let mut tracks_ids: Vec<SpotifyId> = Vec::new();
-    if let Some(uri) = &args.source.uri {
-        let uri = SpotifyId::from_uri(uri).map_err(|_| Errors::InvalidArguments)?;
-        match uri.item_type {
-            SpotifyItemType::Track => {
-                let track = Track::get(&session, &uri)
-                    .await
-                    .map_err(|_| Errors::InvalidPlaylist)?;
-                tracks_ids.push(track.id);
-            }
-            SpotifyItemType::Playlist => {
-                let plist = Playlist::get(&session, &uri)
-                    .await
-                    .map_err(|_| Errors::InvalidPlaylist)?;
-
-                tracks_ids.extend(plist.tracks().cloned());
-            }
-            _ => return Err(Errors::InvalidPlaylist),
-        };
-    }
-    if tracks_ids.is_empty() {
-        return Err(Errors::InvalidPlaylist);
-    };
+    let tracks_ids = args
+        .parse_source(&session)
+        .await
+        .ok_or(Errors::InvalidPlaylist)?;
 
     let sty = ProgressStyle::with_template(
         "[{elapsed_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}",
@@ -111,9 +92,6 @@ async fn main() -> Result<(), Errors> {
             pb.set_message(format!("ERROR: {:?} - {}", e, track.name));
             missing_tracks.push(track);
         };
-        if pb.position() == 4 {
-            eprintln!("ERROR: Downloading song.");
-        }
 
         pb.inc(1);
         pb.set_message("sleeping 💤");
