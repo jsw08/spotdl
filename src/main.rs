@@ -7,11 +7,11 @@ use authentication::authorize;
 use clap::Parser;
 use cli::Args;
 use directories::ProjectDirs;
-use downloader::{DlErrors, DownloadTrack, DownloadTrackStatus, FetchTrackStatus, SpotifyIDs};
+use downloader::{DlErrors, DownloadTrack, DownloadTrackStatus, FetchTrackStatus, };
 use errors::Errors;
 use indicatif::{ProgressBar, ProgressStyle};
-use librespot_core::cache::Cache;
-use librespot_metadata::Track;
+use librespot_core::{cache::Cache, SpotifyId};
+use librespot_metadata::{Metadata, Track};
 use std::{env, fs, time};
 
 const LIGHT_GRAY_BOLD: &str = "\x1b[37m";
@@ -54,38 +54,13 @@ async fn main() -> Result<(), Errors> {
 
     let pb = ProgressBar::new(tracks_len as u64);
     pb.set_style(sty.clone());
-    println!("{LIGHT_GRAY_BOLD}[1/2]{RESET} 🔍 Fetching song metadata...");
 
-    let tracks = track_ids
-        .get_tracks(
-            &session,
-            Some(|status| {
-                pb.inc(1);
-                match status {
-                    FetchTrackStatus::Error(err, id) => {
-                        eprintln!("Failed to fetch metadata about id: {}", id);
-                        pb.set_message(format!("ERROR ({id}): {err}"));
-                    }
-                    FetchTrackStatus::Update(name) => {
-                        pb.set_message(name);
-                    }
-                }
-            }),
-        )
-        .await
-        .ok_or(Errors::InvalidPlaylist)?;
-
-    pb.finish_and_clear();
-    println!("{LIGHT_GRAY_BOLD}[2/2]{RESET} 🔐 Downloading and decrypting songs...");
-    let pb = ProgressBar::new(tracks_len as u64);
-    pb.set_style(sty.clone());
-
-    let mut missing_tracks: Vec<Track> = Vec::new();
+    let mut missing_tracks: Vec<(SpotifyId, String)> = Vec::new();
     let mut last_track = time::Instant::now();
     let delay = time::Duration::from_millis(args.timeout);
 
-    for (index, track) in tracks.iter().enumerate() {
-        pb.set_message(format!("{}", track.name));
+    for (index, track) in track_ids.iter().enumerate() {
+        let name: String = Track::get(&session, track).await.map(|v| v.name).unwrap_or("track not found".to_string());
 
         if let Err(e) = track
             .download(
@@ -93,10 +68,11 @@ async fn main() -> Result<(), Errors> {
                 &path,
                 Some(|cback| match cback {
                     DownloadTrackStatus::Searching => {
-                        pb.set_message(format!("🔎 Searching for files '{}'...", track.name))
+                        pb.set_message(format!("🔎 Searching for song {name}..."))
                     }
-                    DownloadTrackStatus::Downloading => {
-                        pb.set_message(format!("🔐 Downloading and decrypting '{}'...", track.name))
+                    DownloadTrackStatus::Downloading(given_name) => {
+                        pb.set_message(format!("🔐 Downloading and decrypting '{}'...", given_name));
+                        // name = Some(given_name);
                     }
                 }),
             )
@@ -107,8 +83,8 @@ async fn main() -> Result<(), Errors> {
                 continue;
             };
 
-            pb.set_message(format!("ERROR: {:?} - {}", e, track.name));
-            missing_tracks.push(track.clone());
+            println!("ERROR: {:?} - {} ({})", e, name, track);
+            missing_tracks.push((track.clone(), name));
         };
 
         pb.inc(1);
@@ -129,17 +105,11 @@ async fn main() -> Result<(), Errors> {
 
     if !missing_tracks.is_empty() {
         println!("Failed to download a few songs:");
-        for track in missing_tracks {
+        for (track, name) in missing_tracks {
             println!(
-                "{} by {} ({}).",
-                track.name,
-                track
-                    .artists
-                    .iter()
-                    .map(|artist| artist.name.clone())
-                    .collect::<Vec<String>>()
-                    .join(", "),
-                track.id.to_uri().unwrap_or("no id".to_string())
+                "{} ({}).",
+                name,
+                track.to_uri().unwrap_or("no id".to_string())
             );
         }
     }

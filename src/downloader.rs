@@ -6,13 +6,22 @@ use librespot_metadata::{
     audio::{item::AudioItemResult, AudioFileFormat, AudioFiles, AudioItem}, Metadata, Track
 };
 
+const FORMATS: [(AudioFileFormat, u16); 3] = [
+    ( AudioFileFormat::OGG_VORBIS_320, 320 ),
+    ( AudioFileFormat::OGG_VORBIS_160, 160 ),
+    ( AudioFileFormat::OGG_VORBIS_96, 96 ),
+];
+
 #[derive(Debug)]
 pub enum DlErrors {
+    TrackNotFound,
     TrackExists,
+    TrackUnavailable,
     NoAudioFiles,
     NoEncryptedAudio,
     BufferWrite,
     Decrypting,
+    NoKey
 }
 
 pub enum FetchTrackStatus {
@@ -21,33 +30,50 @@ pub enum FetchTrackStatus {
 }
 pub enum DownloadTrackStatus {
     Searching,
-    Downloading,
+    Downloading(String),
 }
 
-async fn find_available_alternative(session: &Session, audio_item: AudioItem) -> Option<AudioItem> {
-    if let Err(_) = audio_item.availability {
-        None
-    } else if !audio_item.files.is_empty() {
-        Some(audio_item)
-    } else if let Some(alternatives) = &audio_item.alternatives {
-        let mut alternative_files: Vec<AudioItem> = Vec::new();
+pub trait GetTrackOrAlternative {
+    async fn get_file_or_alternative(session: &Session, id: SpotifyId) -> Result<AudioItem, DlErrors>;
+}
+impl GetTrackOrAlternative for AudioFile {
+    async fn get_file_or_alternative(session: &Session, id: SpotifyId) -> Result<AudioItem, DlErrors> {
+        let item = AudioItem::get_file(&session, id)
+            .await
+            .map_err(|_| DlErrors::TrackNotFound)?;
 
-        for alt_id in alternatives.iter() {
-            let file = match AudioItem::get_file(session, *alt_id).await {
-                Ok(v) => v,
-                _ => continue
-            };
-            if let Err(_) = file.availability {continue};
+        if item.availability.is_ok() && !item.files.is_empty() {
+            return Ok(item)
+        }; 
 
-            
-            alternative_files.push(file);
-        }
+        if let Some(alternatives) = item.alternatives {
+            let mut alternative_files: Option<AudioItem> = None;
 
-        alternative_files.iter().next().cloned()
-    } else {
-        None
+            for alt_id in alternatives.iter() {
+                let file = match AudioItem::get_file(session, *alt_id).await {
+                    Ok(v) => v,
+                    _ => continue
+                };
+                if let Err(_) = file.availability {continue};
+
+
+                let mut has_ogg = false;
+                for (format, _) in FORMATS {
+                    if file.files.contains_key(&format) {has_ogg = true; break}
+                }
+                if !has_ogg {continue}
+
+                alternative_files = Some(file);
+                break
+            }
+
+            return alternative_files.ok_or(DlErrors::TrackUnavailable)
+        } 
+
+        Err(DlErrors::TrackUnavailable)
     }
 }
+
 
 pub trait DownloadTrack {
     async fn download<F>(
@@ -59,7 +85,7 @@ pub trait DownloadTrack {
     where
         F: Fn(DownloadTrackStatus) -> ();
 }
-impl DownloadTrack for Track {
+impl DownloadTrack for SpotifyId {
     async fn download<F>(
         &self,
         session: &Session,
@@ -67,107 +93,46 @@ impl DownloadTrack for Track {
         callback: Option<F>,
     ) -> Result<PathBuf, DlErrors>
     where
-        F: Fn(DownloadTrackStatus),
-    {
-        let callback = |status: DownloadTrackStatus| {
-            if let Some(cback) = &callback {
-                cback(status)
-            }
-        };
+        F: Fn(DownloadTrackStatus) -> () {
+            let callback = |status: DownloadTrackStatus| callback.map(|v| v(status));
 
-        callback(DownloadTrackStatus::Searching);
-
-        let item = AudioItem::get_file(&session, self.id).await.unwrap();
-        item.alternatives
-
-        let mut file: Option<(u8, FileId)> = None;
-        let mut update_file = |files: AudioFiles| {
-            println!("{:?}", files);
-            if files.is_empty() {
-                return;
-            };
-
-            for i in files.iter() {
-                let ranking = match i.0 {
-                    AudioFileFormat::OGG_VORBIS_320 => 0,
-                    AudioFileFormat::OGG_VORBIS_160 => 1,
-                    AudioFileFormat::OGG_VORBIS_96 => 2,
-                    _ => continue,
+            let item = AudioFile::get_file_or_alternative(&session, *self).await?;
+            let mut file: Option<(&FileId, u16)> = None;
+            for (format, bitrate) in FORMATS {
+                println!("{:?}, {}", format, bitrate);
+                let current_file_id = match item.files.get(&format) {
+                    Some(v) => v,
+                    None => continue
                 };
 
-                match file {
-                    Some(i) if i.0 > ranking => continue,
-                    _ => {}
-                };
-                file = Some((ranking, *i.1))
+                file = Some((current_file_id, bitrate));
+                break
             }
-        };
+            let (file_id, file_bitrate) = file.ok_or(DlErrors::NoAudioFiles)?;
 
-        update_file(self.files.clone());
-        for i in self.alternatives.iter() {
-            let _ = Track::get(session, i)
-                .await
-                .map(|track| update_file(track.files));
-        }
-        let (_, file) = file.ok_or(DlErrors::NoAudioFiles)?;
-
-        let path = path.join(format!("{}_{}.ogg", self.album.name, self.name));
-        if path.exists() {
-            return Err(DlErrors::TrackExists);
-        }
-
-        callback(DownloadTrackStatus::Downloading);
-        let key = session.audio_key().request(self.id, file).await.ok();
-        let mut encrypted_data = AudioFile::open(session, file, 320)
-            .await
-            .map_err(|_| DlErrors::NoEncryptedAudio)?;
-        let mut buffer = Vec::new();
-        AudioDecrypt::new(key, &mut encrypted_data)
-            .read_to_end(&mut buffer)
-            .map_err(|_| DlErrors::Decrypting)?;
-        fs::write(&path, &buffer[..]).map_err(|e| {
-            eprintln!("{:?}", e);
-            DlErrors::BufferWrite
-        })?;
-
-        return Ok(path);
-    }
-}
-
-pub trait SpotifyIDs {
-    async fn get_tracks<F>(&self, session: &Session, callback: Option<F>) -> Option<Vec<Track>>
-    where
-        F: Fn(FetchTrackStatus) -> ();
-}
-impl SpotifyIDs for Vec<SpotifyId> {
-    async fn get_tracks<F>(&self, session: &Session, callback: Option<F>) -> Option<Vec<Track>>
-    where
-        F: Fn(FetchTrackStatus) -> (),
-    {
-        let callback = |status: FetchTrackStatus| {
-            if let Some(cback) = &callback {
-                cback(status)
+            let path = path.join(format!("{} - {}.ogg", item.uri, item.name));
+            if path.exists() {
+                return Err(DlErrors::TrackExists);
             }
-        };
-        let mut tracks: Vec<Track> = Vec::new();
 
-        for id in self {
-            match Track::get(&session, &id).await {
-                Ok(v) => {
-                    callback(FetchTrackStatus::Update(v.name.clone()));
-                    tracks.push(v);
-                }
+            callback(DownloadTrackStatus::Downloading(item.name.clone()));
+            let key = match session.audio_key().request(*self, *file_id).await {
+                Ok(v) => Some(v),
                 Err(e) => {
-                    callback(FetchTrackStatus::Error(e, *id));
-                    continue;
+                    eprintln!("Error getting key for '{}': '{}'. Trying to download without decrypting.", item.name, e);
+                    None
                 }
-            };
-        }
 
-        if tracks.is_empty() {
-            None
-        } else {
-            Some(tracks)
+            };
+            let mut encrypted_data = AudioFile::open(session, *file_id, file_bitrate as usize)
+                .await
+                .map_err(|_| DlErrors::NoEncryptedAudio)?;
+            let mut buffer = Vec::new();
+            AudioDecrypt::new(key, &mut encrypted_data)
+                .read_to_end(&mut buffer)
+                .map_err(|_| DlErrors::Decrypting)?;
+            fs::write(&path, &buffer[0x7a..]).map_err( |_| DlErrors::BufferWrite)?;
+
+            Ok(path)
         }
-    }
 }

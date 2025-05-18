@@ -33,7 +33,7 @@ impl Args {
 
         if source.contains("open.spotify.com") {
             let cap =
-                Regex::new(r"(?:https?:\/\/)?(?:www.)?open.spotify.com\/(\w+)\/(\w+)(?:\?.+)?")
+                Regex::new(r"(?:https?:\/\/)?(?:www.)?open.spotify.com\/(?:user\/\w+\/)?(\w+)\/(\w+)(?:\?.+)?")
                     .ok()
                     .and_then(|re| re.captures(&self.source))
                     .ok_or(Errors::InvalidArguments)?;
