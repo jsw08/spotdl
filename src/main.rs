@@ -114,7 +114,12 @@ async fn main() -> Result<(), Errors> {
         pb.inc(1);
         if index + 1 != tracks_len {
             pb.set_message("💤 Sleeping...");
-            tokio::time::sleep(delay - last_track.elapsed()).await;
+            let timeout = if last_track.elapsed() >= delay {
+                time::Duration::from_secs(0)
+            } else {
+                delay - last_track.elapsed()
+            };
+            tokio::time::sleep(timeout).await;
             last_track = time::Instant::now();
         }
     }
