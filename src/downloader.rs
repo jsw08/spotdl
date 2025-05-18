@@ -3,8 +3,7 @@ use std::{fs, io::Read, path::PathBuf};
 use librespot_audio::{AudioDecrypt, AudioFile};
 use librespot_core::{FileId, SpotifyId, session::Session};
 use librespot_metadata::{
-    Metadata, Track,
-    audio::{AudioFileFormat, AudioFiles},
+    audio::{item::AudioItemResult, AudioFileFormat, AudioFiles, AudioItem}, Metadata, Track
 };
 
 #[derive(Debug)]
@@ -23,6 +22,31 @@ pub enum FetchTrackStatus {
 pub enum DownloadTrackStatus {
     Searching,
     Downloading,
+}
+
+async fn find_available_alternative(session: &Session, audio_item: AudioItem) -> Option<AudioItem> {
+    if let Err(_) = audio_item.availability {
+        None
+    } else if !audio_item.files.is_empty() {
+        Some(audio_item)
+    } else if let Some(alternatives) = &audio_item.alternatives {
+        let mut alternative_files: Vec<AudioItem> = Vec::new();
+
+        for alt_id in alternatives.iter() {
+            let file = match AudioItem::get_file(session, *alt_id).await {
+                Ok(v) => v,
+                _ => continue
+            };
+            if let Err(_) = file.availability {continue};
+
+            
+            alternative_files.push(file);
+        }
+
+        alternative_files.iter().next().cloned()
+    } else {
+        None
+    }
 }
 
 pub trait DownloadTrack {
@@ -52,8 +76,13 @@ impl DownloadTrack for Track {
         };
 
         callback(DownloadTrackStatus::Searching);
+
+        let item = AudioItem::get_file(&session, self.id).await.unwrap();
+        item.alternatives
+
         let mut file: Option<(u8, FileId)> = None;
         let mut update_file = |files: AudioFiles| {
+            println!("{:?}", files);
             if files.is_empty() {
                 return;
             };
@@ -67,18 +96,19 @@ impl DownloadTrack for Track {
                 };
 
                 match file {
-                    Some(i) if i.0 >= ranking => continue,
+                    Some(i) if i.0 > ranking => continue,
                     _ => {}
                 };
                 file = Some((ranking, *i.1))
             }
         };
+
+        update_file(self.files.clone());
         for i in self.alternatives.iter() {
             let _ = Track::get(session, i)
                 .await
                 .map(|track| update_file(track.files));
         }
-        update_file(self.files.clone());
         let (_, file) = file.ok_or(DlErrors::NoAudioFiles)?;
 
         let path = path.join(format!("{}_{}.ogg", self.album.name, self.name));
@@ -95,7 +125,7 @@ impl DownloadTrack for Track {
         AudioDecrypt::new(key, &mut encrypted_data)
             .read_to_end(&mut buffer)
             .map_err(|_| DlErrors::Decrypting)?;
-        fs::write(&path, &buffer[0xa7..]).map_err(|e| {
+        fs::write(&path, &buffer[..]).map_err(|e| {
             eprintln!("{:?}", e);
             DlErrors::BufferWrite
         })?;
